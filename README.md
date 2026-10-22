@@ -21,7 +21,7 @@ Requirements
 
 Setup
 
-1. Install dependencies with `python -m pip install -r requirements.txt`.
+1. Install dependencies with `python -m pip install -r requirements.txt`, then install the headless Chromium browser with `python -m playwright install chromium`.
 2. Create a Discord application and bot. In the Developer Portal, enable **Message Content Intent** under Bot > Privileged Gateway Intents. Invite it to your server with the `bot` and `applications.commands` scopes and `View Channel` and `Send Messages` permissions in the channels where it will be used.
 3. Set these environment variables in your local terminal:
 
@@ -33,7 +33,7 @@ Setup
 
 4. Start the tracker with `python tracker.py`.
 
-The bot checks the stores every 30 seconds and posts an alert when a store changes to an in-stock result. Store names in status reports and stock alerts link directly to each store page. Use `!ping` to confirm the bot is alive, see whether polling is running, and see when its last store scan completed. Use `!status` or `/status` for an on-demand report; only the configured admin user can run them. Use `!help` to list available commands. Logs are written to the process console.
+The bot checks the stores every 30 seconds. For each store it tries a configured or discoverable public JSON API, JSON-LD, embedded JSON, rendered browser content, and finally conservative HTML parsing. It only reports a stock state when the exact ₹1,000 PlayStation product is matched and the product-specific stock evidence is unambiguous. Reports include the detected product, listed price when available, and detection method; links open the store page. Use `!ping` to confirm the bot is alive, see whether polling is running, and see when its last store scan completed. Use `!status` or `/status` for an on-demand report; only the configured admin user can run them. Use `!help` to list available commands. Logs are written to the process console.
 
 Security
 

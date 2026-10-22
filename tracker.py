@@ -1,10 +1,13 @@
 import asyncio
+import json
 import logging
 import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from enum import Enum
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -22,10 +25,28 @@ class StockState(str, Enum):
     UNKNOWN = "Unknown"
 
 
+class DetectionMethod(str, Enum):
+    API = "Public API"
+    JSON_LD = "JSON-LD"
+    EMBEDDED_JSON = "Embedded JSON"
+    BROWSER = "Browser"
+    HTML = "HTML"
+
+
 @dataclass(frozen=True)
 class Store:
     name: str
     url: str
+    api_url: str | None = None
+
+
+@dataclass(frozen=True)
+class ProductObservation:
+    name: str
+    state: StockState
+    price: str | None
+    method: DetectionMethod
+    conflicting: bool = False
 
 
 @dataclass(frozen=True)
@@ -33,6 +54,9 @@ class StoreResult:
     store: Store
     state: StockState
     detail: str
+    product_name: str | None = None
+    price: str | None = None
+    method: DetectionMethod | None = None
 
 
 STORES = (
@@ -53,7 +77,16 @@ STORES = (
 )
 
 TARGET_PATTERN = re.compile(
-    r"(?:₹|\brs\.?\s*|\binr\s*)\s*1[\s,]?000\b|\b1[\s,]?000\s*(?:₹|\brs\.?\b|\binr\b)",
+    r"(?:₹|\brs\.?\s*|\binr\s*)\s*1[\s,]?000\b"
+    r"|\b1[\s,]?000\s*(?:₹|\brs\.?\b|\binr\b)"
+    r"|\b1[\s,]?000\s*(?:wallet|top[ -]?up|gift[ -]?card|psn|playstation)\b"
+    r"|\b(?:wallet|top[ -]?up|gift[ -]?card|psn|playstation)[\w\s-]{0,24}"
+    r"1[\s,]?000\b",
+    re.IGNORECASE,
+)
+PRICE_PATTERN = re.compile(r"(?:₹|\bINR\s*|\bRs\.?\s*)([\d,]+(?:\.\d{1,2})?)", re.IGNORECASE)
+TARGET_PRICE_PATTERN = re.compile(
+    r"(?:₹|\bINR\s*|\bRs\.?\s*)1[\s,]?000\b|\b1[\s,]?000\s*(?:₹|\bINR\b|\bRs\.?\b)",
     re.IGNORECASE,
 )
 OUT_OF_STOCK = (
@@ -73,64 +106,490 @@ IN_STOCK = (
 )
 
 
-def classify_page(html: str) -> tuple[StockState, str]:
-    soup = BeautifulSoup(html, "html.parser")
-    text = " ".join(soup.stripped_strings)
+def _is_target_product(name: str) -> bool:
+    normalized = re.sub(r"\s+", " ", name).casefold()
+    return ("playstation" in normalized or "psn" in normalized) and bool(
+        TARGET_PATTERN.search(normalized)
+    )
+
+
+def _merge_states(states: list[StockState]) -> StockState:
+    definitive = {state for state in states if state is not StockState.UNKNOWN}
+    if len(definitive) > 1:
+        return StockState.UNKNOWN
+    return next(iter(definitive), StockState.UNKNOWN)
+
+
+def _state_from_text(text: str) -> StockState:
     normalized = re.sub(r"\s+", " ", text).casefold()
+    has_out = any(marker in normalized for marker in OUT_OF_STOCK) or any(
+        marker in normalized for marker in ("outofstock", "soldout", "unavailable")
+    )
+    positive_text = re.sub(
+        r"\b(?:currently\s+|temporarily\s+)?(?:not\s+available|unavailable)\b",
+        " ",
+        normalized,
+    )
+    has_in = any(marker in positive_text for marker in IN_STOCK) or any(
+        marker in positive_text for marker in ("instock",)
+    ) or bool(re.search(r"\bavailable\b", positive_text))
+    if has_out and not has_in:
+        return StockState.OUT_OF_STOCK
+    if has_in and not has_out:
+        return StockState.IN_STOCK
+    return StockState.UNKNOWN
 
-    if not ("playstation" in normalized or "psn" in normalized) or not TARGET_PATTERN.search(normalized):
-        return StockState.UNKNOWN, "The exact ₹1,000 PlayStation product was not found."
 
-    matching_nodes = []
+def _state_from_mapping(data: dict) -> tuple[StockState, bool]:
+    states = []
+    for key, value in data.items():
+        normalized_key = re.sub(r"[^a-z]", "", str(key).casefold())
+        if normalized_key in {"availability", "stockstatus", "inventoryavailability"}:
+            if isinstance(value, str):
+                states.append(_state_from_text(value))
+        elif normalized_key in {"available", "isavailable", "instock", "isinstock", "purchasable"}:
+            if isinstance(value, bool):
+                states.append(StockState.IN_STOCK if value else StockState.OUT_OF_STOCK)
+        elif normalized_key in {"inventoryquantity", "stockquantity", "quantityinstock", "qty"}:
+            try:
+                quantity = float(value)
+            except (TypeError, ValueError):
+                continue
+            states.append(StockState.IN_STOCK if quantity > 0 else StockState.OUT_OF_STOCK)
+        elif normalized_key in {"status", "stock"} and isinstance(value, str):
+            parsed = _state_from_text(value)
+            if parsed is not StockState.UNKNOWN:
+                states.append(parsed)
+    definitive = {state for state in states if state is not StockState.UNKNOWN}
+    return _merge_states(states), len(definitive) > 1
+
+
+def _format_price(value, currency: str = "INR", minor_unit: int | None = None) -> str | None:
+    if isinstance(value, dict):
+        currency = str(value.get("currency", value.get("currencyCode", currency)))
+        minor_unit = value.get("currency_minor_unit", minor_unit)
+        value = value.get("amount", value.get("value", value.get("price")))
+    if value is None or isinstance(value, bool):
+        return None
+    raw = re.sub(r"[^\d.,-]", "", str(value)).replace(",", "")
+    try:
+        amount = Decimal(raw)
+    except InvalidOperation:
+        return None
+    if minor_unit is not None:
+        try:
+            amount /= Decimal(10) ** int(minor_unit)
+        except (TypeError, ValueError, InvalidOperation):
+            return None
+    elif isinstance(value, int) and value >= 10000:
+        amount /= Decimal(100)
+    formatted = f"{amount:,.2f}".rstrip("0").rstrip(".")
+    if currency.upper() in {"INR", "RS", "₹"}:
+        return f"₹{formatted}"
+    return f"{currency.upper()} {formatted}"
+
+
+def _price_from_mapping(data: dict) -> str | None:
+    currency = str(data.get("priceCurrency", data.get("currency_code", data.get("currency", "INR"))))
+    minor_unit = data.get("currency_minor_unit")
+    prices = data.get("prices")
+    if isinstance(prices, dict):
+        return _format_price(prices, currency, minor_unit)
+    for key in (
+        "salePrice",
+        "sale_price",
+        "sellingPrice",
+        "selling_price",
+        "offerPrice",
+        "offer_price",
+        "price",
+        "amount",
+        "regularPrice",
+        "regular_price",
+    ):
+        if key in data:
+            return _format_price(data[key], currency, minor_unit)
+    return None
+
+
+def _product_observations_from_json(data, method: DetectionMethod) -> list[ProductObservation]:
+    observations = []
+
+    def visit(value, inherited_name: str | None = None) -> None:
+        if isinstance(value, list):
+            for item in value:
+                visit(item, inherited_name)
+            return
+        if not isinstance(value, dict):
+            return
+
+        own_name = next(
+            (
+                str(value[key]).strip()
+                for key in ("name", "title", "productName", "product_name", "productTitle", "product_title")
+                if isinstance(value.get(key), (str, int, float)) and str(value[key]).strip()
+            ),
+            None,
+        )
+        if own_name and inherited_name and own_name.casefold() not in inherited_name.casefold():
+            product_name = own_name if _is_target_product(own_name) else f"{inherited_name} {own_name}"
+        else:
+            product_name = own_name or inherited_name
+
+        if product_name and _is_target_product(product_name):
+            state, conflicting = _state_from_mapping(value)
+            observations.append(
+                ProductObservation(
+                    name=product_name,
+                    state=state,
+                    price=_price_from_mapping(value),
+                    method=method,
+                    conflicting=conflicting,
+                )
+            )
+
+        for child in value.values():
+            if isinstance(child, (dict, list)):
+                visit(child, product_name)
+
+    visit(data)
+    return observations
+
+
+def _choose_observation(observations: list[ProductObservation]) -> ProductObservation | None:
+    if not observations:
+        return None
+    states = [observation.state for observation in observations]
+    state = _merge_states(states)
+    conflicting = any(observation.conflicting for observation in observations) or len(
+        {candidate for candidate in states if candidate is not StockState.UNKNOWN}
+    ) > 1
+    best = min(
+        observations,
+        key=lambda observation: (not bool(observation.price), len(observation.name)),
+    )
+    return ProductObservation(best.name, state, best.price, best.method, conflicting)
+
+
+def _jsonld_observations(html: str) -> list[ProductObservation]:
+    soup = BeautifulSoup(html, "html.parser")
+    observations = []
+    for script in soup.find_all("script", attrs={"type": re.compile(r"ld\+json", re.I)}):
+        try:
+            data = json.loads(script.string or script.get_text())
+        except (json.JSONDecodeError, TypeError):
+            continue
+        observations.extend(_product_observations_from_json(data, DetectionMethod.JSON_LD))
+    return observations
+
+
+def _embedded_json_observations(html: str) -> list[ProductObservation]:
+    soup = BeautifulSoup(html, "html.parser")
+    observations = []
+    decoder = json.JSONDecoder()
+    for script in soup.find_all("script"):
+        if re.search(r"ld\+json", str(script.get("type", "")), re.I):
+            continue
+        content = script.string or script.get_text()
+        if not content or len(content) > 1_000_000:
+            continue
+        data_values = []
+        try:
+            data_values.append(json.loads(content))
+        except json.JSONDecodeError:
+            pass
+        if not data_values:
+            for match in re.finditer(r"(?:__\w+|INITIAL_STATE|initialState)\s*=\s*", content):
+                start = content.find("{", match.end())
+                if start < 0:
+                    start = content.find("[", match.end())
+                if start < 0:
+                    continue
+                try:
+                    data, _ = decoder.raw_decode(content[start:])
+                except json.JSONDecodeError:
+                    continue
+                data_values.append(data)
+        for data in data_values:
+            observations.extend(
+                _product_observations_from_json(data, DetectionMethod.EMBEDDED_JSON)
+            )
+    return observations
+
+
+def _html_observations(html: str, method: DetectionMethod = DetectionMethod.HTML) -> list[ProductObservation]:
+    soup = BeautifulSoup(html, "html.parser")
+    targets = []
+    heading = soup.find("h1") or soup.find("title")
+    product_title = " ".join(heading.stripped_strings) if heading else ""
+    observations = []
+
+    if product_title and ("playstation" in product_title.casefold() or "psn" in product_title.casefold()):
+        for node in soup.find_all(True):
+            node_text = re.sub(r"\s+", " ", " ".join(node.stripped_strings)).strip()
+            if not node_text or len(node_text) > 500 or not TARGET_PRICE_PATTERN.search(node_text):
+                continue
+
+            current = node
+            for _ in range(4):
+                variant_text = re.sub(r"\s+", " ", " ".join(current.stripped_strings)).strip()
+                if len(variant_text) > 500:
+                    break
+                if TARGET_PRICE_PATTERN.search(variant_text):
+                    state = _state_from_text(variant_text)
+                    disabled_controls = current.select(
+                        "button[disabled], button[aria-disabled='true'], [data-available='false']"
+                    )
+                    if disabled_controls and state is StockState.UNKNOWN:
+                        state = StockState.OUT_OF_STOCK
+                    if state is not StockState.UNKNOWN:
+                        price_match = PRICE_PATTERN.search(variant_text)
+                        price = _format_price(price_match.group(1)) if price_match else "₹1,000"
+                        observations.append(
+                            ProductObservation(
+                                name=f"{product_title} ₹1,000",
+                                state=state,
+                                price=price,
+                                method=method,
+                            )
+                        )
+                        break
+                if current.parent is None or current.parent.name in {"body", "html"}:
+                    break
+                current = current.parent
+
     for node in soup.find_all(True):
-        node_text = re.sub(r"\s+", " ", " ".join(node.stripped_strings)).casefold()
-        if (
-            ("playstation" in node_text or "psn" in node_text)
-            and TARGET_PATTERN.search(node_text)
-        ):
-            matching_nodes.append((len(node_text), node))
+        text = re.sub(r"\s+", " ", " ".join(node.stripped_strings)).strip()
+        if text and len(text) <= 1000 and _is_target_product(text):
+            targets.append((len(text), node, text))
 
-    if not matching_nodes:
-        return StockState.UNKNOWN, "The product was found, but its stock status could not be isolated."
+    for _, target_node, product_name in sorted(targets, key=lambda item: item[0]):
+        current = target_node
+        for _ in range(7):
+            text = " ".join(current.stripped_strings)
+            state = _state_from_text(text)
+            disabled_controls = current.select("button[disabled], button[aria-disabled='true'], [data-available='false']")
+            if disabled_controls and state is StockState.UNKNOWN:
+                state = StockState.OUT_OF_STOCK
+            if state is not StockState.UNKNOWN or current.parent is None:
+                price = None
+                for price_node in current.select("[itemprop='price'], [data-price], .price, [class*='price']"):
+                    value = price_node.get("content") or price_node.get("data-price") or price_node.get_text(" ", strip=True)
+                    price = _format_price(value)
+                    if price:
+                        break
+                if price is None:
+                    price_match = PRICE_PATTERN.search(text)
+                    if price_match:
+                        price = _format_price(price_match.group(1))
+                observations.append(ProductObservation(product_name, state, price, method))
+                break
+            if current.parent.name in {"body", "html"}:
+                break
+            current = current.parent
+    return observations
 
-    _, product_node = min(matching_nodes, key=lambda item: item[0])
-    product_text = ""
-    current = product_node
-    for _ in range(6):
-        product_text = re.sub(r"\s+", " ", " ".join(current.stripped_strings)).casefold()
-        if any(marker in product_text for marker in OUT_OF_STOCK + IN_STOCK):
-            break
-        if current.parent is None or current.parent.name in ("body", "html"):
-            break
-        current = current.parent
 
-    has_out_signal = any(marker in product_text for marker in OUT_OF_STOCK)
-    has_in_signal = any(marker in product_text for marker in IN_STOCK)
-    if has_out_signal and not has_in_signal:
-        return StockState.OUT_OF_STOCK, "The product section indicates it is unavailable."
-    if has_in_signal and not has_out_signal:
-        return StockState.IN_STOCK, "The product section indicates it can be purchased."
-    return StockState.UNKNOWN, "The product was found, but stock evidence is missing or conflicting."
+def classify_page(html: str) -> tuple[StockState, str]:
+    observation = _choose_observation(_html_observations(html))
+    if observation is None:
+        return StockState.UNKNOWN, "The exact ₹1,000 PlayStation product was not found."
+    if observation.state is StockState.IN_STOCK:
+        return observation.state, "The product section indicates it can be purchased."
+    if observation.state is StockState.OUT_OF_STOCK:
+        return observation.state, "The product section indicates it is unavailable."
+    return observation.state, "The product was found, but stock evidence is missing or conflicting."
 
 
-async def check_store(session: aiohttp.ClientSession, store: Store) -> StoreResult:
+def discover_public_api_urls(store: Store, html: str) -> list[str]:
+    candidates = [store.api_url] if store.api_url else []
+    soup = BeautifulSoup(html, "html.parser")
+    for link in soup.find_all("link", href=True):
+        link_type = str(link.get("type", "")).casefold()
+        rel = " ".join(link.get("rel", [])).casefold()
+        if "json" in link_type and ("alternate" in rel or "api" in rel):
+            candidates.append(urljoin(store.url, link["href"]))
+
+    page_text = html.casefold()
+    parsed_url = urlsplit(store.url)
+    origin = urlunsplit((parsed_url.scheme, parsed_url.netloc, "", "", ""))
+    if any(marker in page_text for marker in ("cdn.shopify.com", "shopify.theme", "shopifyanalytics")):
+        product_match = re.search(r"/products/([^/?#]+)", parsed_url.path)
+        if product_match:
+            candidates.append(
+                urljoin(origin, f"/products/{product_match.group(1)}.js")
+            )
+        else:
+            candidates.append(urljoin(origin, "/products.json?limit=250"))
+
+    if any(marker in page_text for marker in ("woocommerce", "wc-blocks", "wc-store-api")):
+        candidates.append(
+            urljoin(origin, "/wp-json/wc/store/v1/products?search=PlayStation&per_page=100")
+        )
+    return list(dict.fromkeys(candidates))
+
+
+class BrowserRenderer:
+    def __init__(self) -> None:
+        self._manager = None
+        self._playwright = None
+        self._browser = None
+        self._lock = asyncio.Lock()
+        self._semaphore = asyncio.Semaphore(1)
+
+    async def _ensure_browser(self):
+        async with self._lock:
+            if self._browser is not None:
+                return self._browser
+            from playwright.async_api import async_playwright
+
+            self._manager = async_playwright()
+            self._playwright = await self._manager.start()
+            self._browser = await self._playwright.chromium.launch(headless=True)
+            return self._browser
+
+    async def fetch(self, url: str) -> str | None:
+        try:
+            async with self._semaphore:
+                browser = await self._ensure_browser()
+                page = await browser.new_page()
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                    await page.wait_for_timeout(1000)
+                    return await page.content()
+                finally:
+                    await page.close()
+        except Exception as error:
+            logger.warning("Browser fallback failed for %s: %s", url, type(error).__name__)
+            return None
+
+    async def close(self) -> None:
+        if self._browser is not None:
+            await self._browser.close()
+            self._browser = None
+        if self._playwright is not None:
+            await self._playwright.stop()
+            self._playwright = None
+
+
+def _store_result(store: Store, observation: ProductObservation | None, detail: str) -> StoreResult:
+    if observation is None:
+        return StoreResult(store, StockState.UNKNOWN, detail)
+    if observation.state is StockState.UNKNOWN:
+        reason = "conflicting" if observation.conflicting else "missing"
+        detail = f"Target product found, but stock evidence is {reason} ({observation.method.value})."
+    else:
+        detail = f"Detected by {observation.method.value}."
+    return StoreResult(
+        store=store,
+        state=observation.state,
+        detail=detail,
+        product_name=observation.name[:120],
+        price=observation.price,
+        method=observation.method,
+    )
+
+
+async def _fetch_api_observations(
+    session: aiohttp.ClientSession, url: str
+) -> list[ProductObservation]:
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+            if response.status >= 400:
+                return []
+            payload = await response.json(content_type=None)
+    except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, ValueError):
+        return []
+    return _product_observations_from_json(payload, DetectionMethod.API)
+
+
+async def check_store(
+    session: aiohttp.ClientSession,
+    store: Store,
+    browser: BrowserRenderer | None = None,
+) -> StoreResult:
+    html = None
+    request_detail = "The store page could not be retrieved."
     try:
         async with session.get(store.url) as response:
             if response.status >= 400:
-                return StoreResult(store, StockState.UNKNOWN, f"HTTP {response.status}")
-            html = await response.text(errors="replace")
+                request_detail = f"HTTP {response.status}"
+            else:
+                html = await response.text(errors="replace")
     except (aiohttp.ClientError, asyncio.TimeoutError) as error:
-        return StoreResult(store, StockState.UNKNOWN, f"Request failed: {type(error).__name__}")
+        request_detail = f"Request failed: {type(error).__name__}"
 
-    state, detail = classify_page(html)
-    return StoreResult(store, state, detail)
+    unresolved = []
+    api_urls = discover_public_api_urls(store, html or "")
+    for api_url in api_urls:
+        observation = _choose_observation(await _fetch_api_observations(session, api_url))
+        if observation is not None:
+            if observation.state is not StockState.UNKNOWN:
+                return _store_result(store, observation, "")
+            if observation.conflicting:
+                return _store_result(store, observation, "")
+            unresolved.append(observation)
+
+    if html:
+        jsonld = _choose_observation(_jsonld_observations(html))
+        if jsonld is not None:
+            if jsonld.state is not StockState.UNKNOWN:
+                return _store_result(store, jsonld, "")
+            if jsonld.conflicting:
+                return _store_result(store, jsonld, "")
+            unresolved.append(jsonld)
+
+        embedded = _choose_observation(_embedded_json_observations(html))
+        if embedded is not None:
+            if embedded.state is not StockState.UNKNOWN:
+                return _store_result(store, embedded, "")
+            if embedded.conflicting:
+                return _store_result(store, embedded, "")
+            unresolved.append(embedded)
+
+    rendered_html = await browser.fetch(store.url) if browser is not None else None
+    if rendered_html:
+        rendered_candidates = []
+        rendered_candidates.extend(_jsonld_observations(rendered_html))
+        rendered_candidates.extend(_embedded_json_observations(rendered_html))
+        rendered_candidates.extend(_html_observations(rendered_html, DetectionMethod.BROWSER))
+        rendered = _choose_observation(rendered_candidates)
+        if rendered is not None:
+            if rendered.state is not StockState.UNKNOWN:
+                return _store_result(store, rendered, "")
+            if rendered.conflicting:
+                return _store_result(store, rendered, "")
+            unresolved.append(rendered)
+
+    if html:
+        static_html = _choose_observation(_html_observations(html))
+        if static_html is not None:
+            if static_html.state is not StockState.UNKNOWN:
+                return _store_result(store, static_html, "")
+            if static_html.conflicting:
+                return _store_result(store, static_html, "")
+            unresolved.append(static_html)
+
+    if unresolved:
+        return _store_result(
+            store,
+            unresolved[-1],
+            "The product was found, but stock evidence is missing or conflicting.",
+        )
+    return _store_result(store, None, request_detail if html is None else "Exact target product not found.")
 
 
 async def check_all_stores() -> list[StoreResult]:
     timeout = aiohttp.ClientTimeout(total=20)
     headers = {"User-Agent": "PSNStockTracker/1.0 (personal stock monitoring bot)"}
-    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-        return await asyncio.gather(*(check_store(session, store) for store in STORES))
+    browser = BrowserRenderer()
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            return await asyncio.gather(
+                *(check_store(session, store, browser) for store in STORES)
+            )
+    finally:
+        await browser.close()
 
 
 def should_alert(previous: StockState | None, current: StockState) -> bool:
@@ -140,16 +599,30 @@ def should_alert(previous: StockState | None, current: StockState) -> bool:
 def format_report(results: list[StoreResult]) -> str:
     checked_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [f"PSN ₹1,000 stock status | {checked_at}"]
-    lines.extend(
-        f"- [{result.store.name}]({result.store.url}): {result.state.value} ({result.detail})"
-        for result in results
-    )
+    for result in results:
+        details = [result.state.value]
+        if result.product_name:
+            details.append(result.product_name)
+        if result.price:
+            details.append(f"price {result.price}")
+        if result.method:
+            details.append(f"via {result.method.value}")
+        details.append(result.detail)
+        lines.append(
+            f"- [{result.store.name}]({result.store.url}): "
+            + " | ".join(details)
+        )
     return "\n".join(lines)
 
 
-def format_stock_alert(store: Store) -> str:
+def format_stock_alert(
+    store: Store, product_name: str | None = None, price: str | None = None
+) -> str:
+    product = f" ({product_name})" if product_name else ""
+    price_detail = f" Listed price: {price}." if price else ""
     return (
-        f"Stock detected: {store.name} may have the PSN ₹1,000 wallet top-up in stock.\n"
+        f"Stock detected: {store.name}{product} may have the PSN ₹1,000 wallet top-up in stock."
+        f"{price_detail}\n"
         f"[Open {store.name}]({store.url})"
     )
 
@@ -251,7 +724,9 @@ class TrackerBot(discord.Client):
                     self.last_states[store_name] = result.state
                 logger.info("%s: %s (%s)", store_name, result.state.value, result.detail)
                 if should_alert(previous, result.state):
-                    await channel.send(format_stock_alert(result.store))
+                    await channel.send(
+                        format_stock_alert(result.store, result.product_name, result.price)
+                    )
         except (discord.DiscordException, aiohttp.ClientError, asyncio.TimeoutError):
             logger.exception("The scheduled stock check could not be completed")
 

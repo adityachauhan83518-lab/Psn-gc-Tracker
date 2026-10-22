@@ -1,3 +1,4 @@
 aiohttp>=3.9,<4
 beautifulsoup4>=4.12,<5
 discord.py>=2.3,<3
+playwright>=1.50,<2
