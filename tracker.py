@@ -154,6 +154,16 @@ def format_stock_alert(store: Store) -> str:
     )
 
 
+def format_help() -> str:
+    return (
+        "**PSN Stock Tracker commands**\n"
+        "`!ping` - Check whether the bot and store polling are running.\n"
+        "`!status` - Check all stores and get clickable product links (admin only).\n"
+        "`/status` - Same on-demand store report as a slash command (admin only).\n"
+        "`!help` - Show this command list."
+    )
+
+
 def format_ping(last_check_at: datetime | None, polling: bool) -> str:
     if not polling:
         return "I'm alive, but store polling is not running."
@@ -206,11 +216,24 @@ class TrackerBot(discord.Client):
         await interaction.followup.send(format_report(results), ephemeral=True)
 
     async def on_message(self, message: discord.Message) -> None:
-        if message.author.bot or message.content.strip().casefold() != "!ping":
+        if message.author.bot:
             return
-        await message.channel.send(
-            format_ping(self.last_check_at, self.poll_stores.is_running())
-        )
+
+        command = message.content.strip().casefold()
+        if command == "!ping":
+            await message.channel.send(
+                format_ping(self.last_check_at, self.poll_stores.is_running())
+            )
+        elif command == "!help":
+            await message.channel.send(format_help())
+        elif command == "!status":
+            if message.author.id != self.admin_user_id:
+                await message.channel.send("You are not authorized to use this command.")
+                return
+
+            status_message = await message.channel.send("Checking all stores...")
+            results = await check_all_stores()
+            await status_message.edit(content=format_report(results))
 
     @tasks.loop(seconds=30)
     async def poll_stores(self) -> None:

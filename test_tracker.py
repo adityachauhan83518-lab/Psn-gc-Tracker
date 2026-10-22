@@ -6,6 +6,7 @@ from tracker import (
     StockState,
     StoreResult,
     classify_page,
+    format_help,
     format_ping,
     format_report,
     format_stock_alert,
@@ -50,6 +51,12 @@ class StatusReportTests(unittest.TestCase):
         for store in STORES:
             with self.subTest(store=store.name):
                 self.assertIn(f"[{store.name}]({store.url})", report)
+
+    def test_help_lists_available_commands(self):
+        help_message = format_help()
+        for command in ("!ping", "!status", "/status", "!help"):
+            with self.subTest(command=command):
+                self.assertIn(f"`{command}`", help_message)
 
 
 class PingMessageTests(unittest.TestCase):

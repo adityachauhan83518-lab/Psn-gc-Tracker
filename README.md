@@ -33,7 +33,7 @@ Setup
 
 4. Start the tracker with `python tracker.py`.
 
-The bot checks the stores every 30 seconds and posts an alert when a store changes to an in-stock result. Store names in status reports and stock alerts link directly to each store page. Use `!ping` to confirm the bot is alive, see whether polling is running, and see when its last store scan completed. Use `/status` for an on-demand report; only the configured admin user can run it. Logs are written to the process console.
+The bot checks the stores every 30 seconds and posts an alert when a store changes to an in-stock result. Store names in status reports and stock alerts link directly to each store page. Use `!ping` to confirm the bot is alive, see whether polling is running, and see when its last store scan completed. Use `!status` or `/status` for an on-demand report; only the configured admin user can run them. Use `!help` to list available commands. Logs are written to the process console.
 
 Security
 
