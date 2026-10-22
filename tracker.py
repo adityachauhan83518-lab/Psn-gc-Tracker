@@ -141,10 +141,17 @@ def format_report(results: list[StoreResult]) -> str:
     checked_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [f"PSN ₹1,000 stock status | {checked_at}"]
     lines.extend(
-        f"- {result.store.name}: {result.state.value} ({result.detail})"
+        f"- [{result.store.name}]({result.store.url}): {result.state.value} ({result.detail})"
         for result in results
     )
     return "\n".join(lines)
+
+
+def format_stock_alert(store: Store) -> str:
+    return (
+        f"Stock detected: {store.name} may have the PSN ₹1,000 wallet top-up in stock.\n"
+        f"[Open {store.name}]({store.url})"
+    )
 
 
 def format_ping(last_check_at: datetime | None, polling: bool) -> str:
@@ -221,10 +228,7 @@ class TrackerBot(discord.Client):
                     self.last_states[store_name] = result.state
                 logger.info("%s: %s (%s)", store_name, result.state.value, result.detail)
                 if should_alert(previous, result.state):
-                    await channel.send(
-                        f"Stock detected: {result.store.name} may have the PSN ₹1,000 wallet top-up in stock.\n"
-                        f"{result.store.url}"
-                    )
+                    await channel.send(format_stock_alert(result.store))
         except (discord.DiscordException, aiohttp.ClientError, asyncio.TimeoutError):
             logger.exception("The scheduled stock check could not be completed")
 

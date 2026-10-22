@@ -1,7 +1,16 @@
 import unittest
 from datetime import datetime, timezone
 
-from tracker import StockState, classify_page, format_ping, should_alert
+from tracker import (
+    STORES,
+    StockState,
+    StoreResult,
+    classify_page,
+    format_ping,
+    format_report,
+    format_stock_alert,
+    should_alert,
+)
 
 
 class ClassifyPageTests(unittest.TestCase):
@@ -25,6 +34,22 @@ class ClassifyPageTests(unittest.TestCase):
 class AlertTransitionTests(unittest.TestCase):
     def test_alerts_when_product_becomes_available(self):
         self.assertTrue(should_alert(StockState.OUT_OF_STOCK, StockState.IN_STOCK))
+
+    def test_stock_alert_contains_clickable_store_link(self):
+        message = format_stock_alert(STORES[0])
+        self.assertIn(f"[Open {STORES[0].name}]({STORES[0].url})", message)
+
+
+class StatusReportTests(unittest.TestCase):
+    def test_report_links_all_eight_stores(self):
+        results = [
+            StoreResult(store, StockState.UNKNOWN, "Not checked")
+            for store in STORES
+        ]
+        report = format_report(results)
+        for store in STORES:
+            with self.subTest(store=store.name):
+                self.assertIn(f"[{store.name}]({store.url})", report)
 
 
 class PingMessageTests(unittest.TestCase):
